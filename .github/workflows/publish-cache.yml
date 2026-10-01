@@ -1,0 +1,75 @@
+name: Publish Binary Cache (reusable)
+
+# Reusable workflow: builds a caller flake's outputs and pushes the signed NARs
+# to that caller repo's GHCR-backed Nix binary cache (ghcr.io/<caller>/nix-cache).
+#
+# Call it from a project repo with:
+#
+#   jobs:
+#     publish:
+#       uses: pplanel/nixcache/.github/workflows/publish-cache.yml@main
+#       secrets: inherit
+#
+# The caller must grant `packages: write` and hold a NIX_SIGNING_KEY secret
+# (the private binary-cache key). The builder (lib/cache-builder.sh) is GNU/
+# bash-4+ oriented, so it runs inside a `nix shell` providing GNU tools + bash 5.
+
+on:
+  workflow_call:
+    inputs:
+      runs-on:
+        type: string
+        default: macos-15
+        description: Runner label. macOS arm64 is required for aarch64-darwin flakes.
+      config-dir:
+        type: string
+        default: "."
+        description: Flake directory in the caller repo to discover/build outputs from.
+    secrets:
+      NIX_SIGNING_KEY:
+        required: true
+
+jobs:
+  publish:
+    runs-on: ${{ inputs.runs-on }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout caller flake
+        uses: actions/checkout@v4
+
+      - name: Checkout nixcache tooling
+        uses: actions/checkout@v4
+        with:
+          repository: pplanel/nixcache
+          path: .nixcache
+          ref: main
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Set up signing key
+        run: |
+          if [[ -z "${{ secrets.NIX_SIGNING_KEY }}" ]]; then
+            echo "::error::NIX_SIGNING_KEY secret is empty. Add the private key (contents of secret.key) and pass it via 'secrets: inherit'."
+            exit 1
+          fi
+          printf '%s' "${{ secrets.NIX_SIGNING_KEY }}" > "$RUNNER_TEMP/signing-key"
+          nix key convert-secret-to-public < "$RUNNER_TEMP/signing-key" > "$RUNNER_TEMP/signing-key.pub"
+          echo "NIXCACHE_SIGNING_KEY_FILE=$RUNNER_TEMP/signing-key" >> "$GITHUB_ENV"
+          echo ">>> Signing enabled; public key: $(cat "$RUNNER_TEMP/signing-key.pub")"
+
+      - name: Build and publish cache
+        env:
+          NIXCACHE_REPO: ${{ github.repository }}
+          NIXCACHE_CONFIG_DIR: ${{ inputs.config-dir }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          nix shell \
+            nixpkgs#bash nixpkgs#coreutils nixpkgs#gnugrep nixpkgs#gnused \
+            nixpkgs#jq nixpkgs#curl nixpkgs#xz nixpkgs#python3 \
+            --command bash -euo pipefail -c '
+              source .nixcache/lib/cache-builder.sh
+              full_pipeline
+            '
