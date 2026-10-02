@@ -24,6 +24,8 @@ REGISTRY = os.environ.get("NIXCACHE_REGISTRY", "ghcr.io")
 PORT = int(os.environ.get("NIXCACHE_PORT", "37515"))
 LISTEN_ADDR = os.environ.get("NIXCACHE_LISTEN", "127.0.0.1")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", os.environ.get("GH_TOKEN", ""))
+
+
 def _default_index_dir() -> Path:
     # Honour an explicit NIXCACHE_INDEX_DIR first, then systemd's
     # $CACHE_DIRECTORY (set when the unit declares CacheDirectory=),
@@ -150,6 +152,7 @@ def upstream_stream_nar(path: str):
 
 # ── Index ─────────────────────────────────────────────────────────────
 
+
 class CacheIndex:
     def __init__(self):
         self._index: dict | None = None
@@ -183,9 +186,11 @@ class CacheIndex:
                         self._index = json.loads(index_data)
                         self._index_file.parent.mkdir(parents=True, exist_ok=True)
                         self._index_file.write_bytes(index_data)
-                        print(f"[nixcache-proxy] Index refreshed: "
-                              f"{len(self._index.get('entries', {}))} entries",
-                              file=sys.stderr)
+                        print(
+                            f"[nixcache-proxy] Index refreshed: "
+                            f"{len(self._index.get('entries', {}))} entries",
+                            file=sys.stderr,
+                        )
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -216,6 +221,7 @@ cache_index = CacheIndex()
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────
+
 
 def get_nci_response() -> bytes:
     lines = [
@@ -261,16 +267,21 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
 
     def _stream_response(self, resp, content_length: int | None, content_type: str):
         """Stream an upstream response directly to the client."""
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        if content_length is not None:
-            self.send_header("Content-Length", str(content_length))
-        self.end_headers()
-        while True:
-            chunk = resp.read(STREAM_CHUNK_SIZE)
-            if not chunk:
-                break
-            self.wfile.write(chunk)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            if content_length is not None:
+                self.send_header("Content-Length", str(content_length))
+            self.end_headers()
+            while True:
+                chunk = resp.read(STREAM_CHUNK_SIZE)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # O cliente (Nix) cancelou o download abruptamente.
+            # Ignoramos o erro para não travar a thread.
+            pass
 
     def _serve_public_key(self):
         index = cache_index.get()
@@ -318,22 +329,30 @@ class CacheHandler(http.server.BaseHTTPRequestHandler):
 
     def _serve_nar(self, path: str):
         nar_basename = path.removeprefix("/nar/")
-        ct = "application/x-xz" if nar_basename.endswith(".xz") else "application/x-nix-nar"
+        ct = (
+            "application/x-xz"
+            if nar_basename.endswith(".xz")
+            else "application/x-nix-nar"
+        )
 
         # Try our GHCR cache — stream directly
         nar_digest = cache_index.find_nar_digest(nar_basename)
         if nar_digest:
             resp, length = ghcr_stream_blob(nar_digest)
             if resp is not None:
-                self._stream_response(resp, length, ct)
-                resp.close()
+                try:
+                    self._stream_response(resp, length, ct)
+                finally:
+                    resp.close()
                 return
 
         # Fall back to upstream — stream directly
         resp, length = upstream_stream_nar(path)
         if resp is not None:
-            self._stream_response(resp, length, ct)
-            resp.close()
+            try:
+                self._stream_response(resp, length, ct)
+            finally:
+                resp.close()
             return
 
         self.send_error(404)
