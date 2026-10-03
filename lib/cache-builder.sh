@@ -171,7 +171,22 @@ discover_outputs() {
     system=$(nix eval --raw --impure --expr 'builtins.currentSystem')
     info "Discovering flake outputs for $system in $flake_dir"
 
-    local flake_ref="path:$(realpath "$flake_dir")"
+    # Prefer git+file: it hashes only tracked files, exactly like the
+    # github:owner/repo/<rev> ref consumers use, so published store paths
+    # match theirs. path: copies the whole directory — including this
+    # tooling's .nixcache checkout and runner leftovers — so any flake with
+    # `src = ./.` got a different (and per-run unstable) hash.
+    local abs_dir root flake_ref
+    abs_dir=$(realpath "$flake_dir")
+    if root=$(git -C "$abs_dir" rev-parse --show-toplevel 2>/dev/null); then
+        root=$(realpath "$root")
+        flake_ref="git+file://${root}"
+        if [[ "$abs_dir" != "$root" ]]; then
+            flake_ref+="?dir=${abs_dir#"$root"/}"
+        fi
+    else
+        flake_ref="path:${abs_dir}"
+    fi
 
     if [[ ! -f "$flake_dir/flake.lock" ]]; then
         info "Generating flake.lock for $flake_dir"
