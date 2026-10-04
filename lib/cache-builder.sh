@@ -181,8 +181,18 @@ discover_outputs() {
     if root=$(git -C "$abs_dir" rev-parse --show-toplevel 2>/dev/null); then
         root=$(realpath "$root")
         flake_ref="git+file://${root}"
+        local params=()
+        # actions/checkout clones with depth=1; Nix rejects shallow repos
+        # ("shallow Git repository, so 'revCount' is not available") unless
+        # shallow=1 is passed.
+        if [[ "$(git -C "$root" rev-parse --is-shallow-repository)" == "true" ]]; then
+            params+=("shallow=1")
+        fi
         if [[ "$abs_dir" != "$root" ]]; then
-            flake_ref+="?dir=${abs_dir#"$root"/}"
+            params+=("dir=${abs_dir#"$root"/}")
+        fi
+        if [[ ${#params[@]} -gt 0 ]]; then
+            flake_ref+="?$(IFS='&'; echo "${params[*]}")"
         fi
     else
         flake_ref="path:${abs_dir}"
