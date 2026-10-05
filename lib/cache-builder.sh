@@ -591,22 +591,37 @@ start_self_substituter() {
         return 0
     fi
 
+    # Use a free port, not a fixed one: on a self-hosted runner a fixed port
+    # can already belong to a long-running cache proxy, and the readiness
+    # probe below would then talk to *that* proxy instead of ours.
+    # NIXCACHE_SELF_PORT overrides the choice.
+    local port="${NIXCACHE_SELF_PORT:-}"
+    if [[ -z "$port" ]]; then
+        port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    fi
+
     # NIXCACHE_UPSTREAM="" — skip proxy's internal upstream fallback. Nix
     # already queries cache.nixos.org and the flake's other substituters
     # directly in parallel, so the proxy blocking on an upstream HTTP call
     # per miss just serializes what Nix would otherwise do concurrently.
     NIXCACHE_REPO="$NIXCACHE_REPO" \
-    NIXCACHE_PORT=37515 \
+    NIXCACHE_PORT="$port" \
     NIXCACHE_LISTEN=127.0.0.1 \
     NIXCACHE_UPSTREAM="" \
     GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
         python3 "$proxy_script" &
     SELF_PROXY_PID=$!
+    # Undo the proxy and the nix.conf edit even if a later step fails under
+    # `set -e` (stop_self_substituter is idempotent).
+    trap stop_self_substituter EXIT
 
-    # Wait for it to be ready
+    # Wait for it to be ready — and make sure it's our process answering.
     local ready=false
     for i in $(seq 1 15); do
-        if curl -fs --max-time 2 http://127.0.0.1:37515/nix-cache-info >/dev/null 2>&1; then
+        if ! kill -0 "$SELF_PROXY_PID" 2>/dev/null; then
+            break
+        fi
+        if curl -fs --max-time 2 "http://127.0.0.1:$port/nix-cache-info" >/dev/null 2>&1; then
             ready=true
             break
         fi
@@ -614,7 +629,7 @@ start_self_substituter() {
     done
 
     if [[ "$ready" == "true" ]]; then
-        info "Self-substituter running (pid=$SELF_PROXY_PID)"
+        info "Self-substituter running (pid=$SELF_PROXY_PID, port=$port)"
         # Configure Nix to use our own cache during builds
         # Try system config first, fall back to user config
         local nix_conf="/etc/nix/nix.conf"
@@ -622,10 +637,14 @@ start_self_substituter() {
             nix_conf="${HOME}/.config/nix/nix.conf"
             mkdir -p "$(dirname "$nix_conf")"
         fi
-        cat >> "$nix_conf" <<EOF
-extra-substituters = http://127.0.0.1:37515
-extra-trusted-substituters = http://127.0.0.1:37515
-EOF
+        # Fence the lines with markers so stop_self_substituter can remove
+        # exactly them — a self-hosted runner's nix.conf outlives the job.
+        {
+            echo "# >>> nixcache self-substituter >>>"
+            echo "extra-substituters = http://127.0.0.1:$port"
+            echo "extra-trusted-substituters = http://127.0.0.1:$port"
+        } >> "$nix_conf"
+        SELF_NIX_CONF="$nix_conf"
         info "Added self-substituter to $nix_conf"
 
         # Trust our own signing key so Nix will accept signed NARs served
@@ -639,6 +658,7 @@ EOF
                 info "Trusted own public key: $pub_key"
             fi
         fi
+        echo "# <<< nixcache self-substituter <<<" >> "$nix_conf"
     else
         info "Self-substituter failed to start, continuing without it"
         kill "$SELF_PROXY_PID" 2>/dev/null || true
@@ -698,7 +718,14 @@ find_locally_built_paths() {
 stop_self_substituter() {
     if [[ -n "${SELF_PROXY_PID:-}" ]]; then
         kill "$SELF_PROXY_PID" 2>/dev/null || true
+        SELF_PROXY_PID=""
         info "Self-substituter stopped"
+    fi
+    # Remove exactly the block start_self_substituter appended.
+    if [[ -n "${SELF_NIX_CONF:-}" ]] && [[ -f "$SELF_NIX_CONF" ]]; then
+        sed -i '/^# >>> nixcache self-substituter >>>$/,/^# <<< nixcache self-substituter <<<$/d' "$SELF_NIX_CONF"
+        info "Removed self-substituter from $SELF_NIX_CONF"
+        SELF_NIX_CONF=""
     fi
 }
 
