@@ -46,8 +46,17 @@ jobs:
           path: .nixcache
           ref: main
 
+      # Hosted runners get a fresh Nix each job. A self-hosted runner already
+      # has (Determinate) Nix — reinstalling it prompts for sudo to recreate
+      # /var/lib/determinate and fails non-interactively — so skip the installer
+      # there and just put the existing Nix on PATH.
       - name: Install Nix
+        if: runner.environment != 'self-hosted'
         uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Use existing Nix (self-hosted)
+        if: runner.environment == 'self-hosted'
+        run: echo "/nix/var/nix/profiles/default/bin" >> "$GITHUB_PATH"
 
       - name: Set up signing key
         run: |
