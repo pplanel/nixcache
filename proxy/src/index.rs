@@ -31,6 +31,11 @@ pub struct Index {
     /// Digest of the index blob this was parsed from. A refresh whose manifest
     /// still points at it skips the download.
     pub digest: Option<String>,
+    /// False when the registry couldn't be reached and nothing was on disk.
+    /// Lookups then answer 503, not 404: Nix caches a 404 narinfo for an hour
+    /// (narinfo-cache-negative-ttl), so a boot without network would make it
+    /// skip the cache and build everything locally.
+    pub available: bool,
 }
 
 #[derive(Deserialize)]
@@ -58,13 +63,23 @@ struct Layer {
 }
 
 impl Index {
-    fn empty() -> Self {
+    /// The registry has no cache-index for this repo: every lookup is a miss.
+    fn missing() -> Self {
         Self {
             narinfos: HashMap::new(),
             nars: HashMap::new(),
             public_key: None,
             generated: None,
             digest: None,
+            available: true,
+        }
+    }
+
+    /// Nothing could be loaded yet: lookups can't tell a hit from a miss.
+    fn unavailable() -> Self {
+        Self {
+            available: false,
+            ..Self::missing()
         }
     }
 
@@ -73,7 +88,9 @@ impl Index {
         let mut narinfos = HashMap::with_capacity(raw.entries.len());
         let mut nars = HashMap::with_capacity(raw.entries.len());
         for (hash, entry) in raw.entries {
-            let Some(narinfo) = entry.narinfo else { continue };
+            let Some(narinfo) = entry.narinfo else {
+                continue;
+            };
             if let Some(nar_digest) = entry.nar_digest {
                 let url = narinfo.lines().find_map(|l| l.strip_prefix("URL: "));
                 if let Some(file) = url.and_then(|u| u.trim().rsplit('/').next()) {
@@ -88,6 +105,7 @@ impl Index {
             public_key: raw.public_key.filter(|k| !k.is_empty()),
             generated: raw.generated,
             digest,
+            available: true,
         })
     }
 
@@ -132,7 +150,7 @@ pub struct RepoCache {
 
 enum Fetched {
     Unchanged,
-    New(Index, Bytes),
+    New(Box<Index>, Bytes),
     Missing,
 }
 
@@ -174,7 +192,9 @@ impl RepoCache {
             return index;
         }
         self.fetch_and_store().await;
-        self.index.load_full().unwrap_or_else(|| Arc::new(Index::empty()))
+        self.index
+            .load_full()
+            .unwrap_or_else(|| Arc::new(Index::unavailable()))
     }
 
     /// Fetch now, waiting for the result. Returns the entry count.
@@ -211,8 +231,15 @@ impl RepoCache {
     /// Fetch from the registry and update the index and refresh state.
     /// Caller holds `fetch_lock`.
     async fn fetch_and_store(&self) {
-        let known = self.index.load().as_ref().and_then(|i| i.digest.clone());
-        let result = self.fetch(known.as_deref()).await;
+        let current = self.index.load_full();
+        let known = current.as_ref().and_then(|i| i.digest.clone());
+        let mut result = self.fetch(known.as_deref()).await;
+        // A repo that had entries doesn't vanish; a 404/401 then is far more
+        // likely a registry hiccup. Keep the last index rather than turn every
+        // lookup into a miss.
+        if matches!(result, Ok(Fetched::Missing)) && current.is_some_and(|i| i.len() > 0) {
+            result = Err(FetchError::Status(reqwest::StatusCode::NOT_FOUND));
+        }
 
         let mut state = self.state.lock().unwrap();
         state.next = Some(Instant::now() + self.shared.ttl);
@@ -224,7 +251,7 @@ impl RepoCache {
             Ok(Fetched::New(index, blob)) => {
                 info!(repo = %self.repo, entries = index.len(), "index refreshed");
                 let digest = index.digest.clone();
-                self.index.store(Some(Arc::new(index)));
+                self.index.store(Some(Arc::from(index)));
                 state.last_ok = Some(SystemTime::now());
                 state.last_error = None;
                 state.missing = false;
@@ -235,7 +262,7 @@ impl RepoCache {
                 if !state.missing {
                     warn!(repo = %self.repo, "no cache-index in the registry; serving nothing");
                 }
-                self.index.store(Some(Arc::new(Index::empty())));
+                self.index.store(Some(Arc::new(Index::missing())));
                 state.last_ok = Some(SystemTime::now());
                 state.last_error = None;
                 state.missing = true;
@@ -244,10 +271,11 @@ impl RepoCache {
                 warn!(repo = %self.repo, error = %e, "index refresh failed");
                 state.next = Some(Instant::now() + ERROR_BACKOFF);
                 state.last_error = Some(e.to_string());
-                // Keep serving whatever we had; with nothing, serve empty
-                // rather than making every request wait on the registry.
+                // Keep serving whatever we had. With nothing, mark the repo
+                // unavailable rather than make every request wait on the
+                // registry.
                 if self.index.load().is_none() {
-                    self.index.store(Some(Arc::new(Index::empty())));
+                    self.index.store(Some(Arc::new(Index::unavailable())));
                 }
             }
         }
@@ -290,7 +318,7 @@ impl RepoCache {
             .await
             .map_err(FetchError::Http)?;
         match Index::parse(&blob, Some(layer.digest)) {
-            Ok(index) => Ok(Fetched::New(index, blob)),
+            Ok(index) => Ok(Fetched::New(Box::new(index), blob)),
             Err(e) => {
                 warn!(repo = %self.repo, error = %e, "cache-index blob is not valid JSON");
                 Ok(Fetched::Missing)
@@ -340,6 +368,7 @@ impl RepoCache {
         json!({
             "repo": self.repo,
             "loaded": index.is_some(),
+            "available": index.as_ref().is_some_and(|i| i.available),
             "index_entries": index.as_ref().map_or(0, |i| i.len()),
             "index_generated": index.as_ref().and_then(|i| i.generated.clone()),
             "index_digest": index.as_ref().and_then(|i| i.digest.clone()),

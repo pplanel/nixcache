@@ -8,10 +8,11 @@ GHCR-backed Nix binary cache. Single source of truth so individual project repos
 
 - `lib/cache-builder.sh` — builds a flake's outputs and pushes signed NARs to
   `ghcr.io/<owner>/<repo>/nix-cache` as OCI blobs.
-- `proxy/main.py` — local HTTP proxy bridging Nix's binary-cache protocol to GHCR.
+- `proxy/` — `nixcache-proxy`, a local HTTP proxy (Rust) bridging Nix's binary-cache
+  protocol to GHCR. One instance serves every cache, chosen by URL path.
 - `.github/workflows/publish-cache.yml` — **reusable** workflow (`workflow_call`).
-- `flake.nix` — `cache-proxy` package, `apps.cache-proxy`, and a generic
-  `darwinModules.default`.
+- `flake.nix` — `nixcache-proxy` package (alias `cache-proxy`), `apps.cache-proxy`,
+  and a generic `darwinModules.default`.
 
 ## Publish a repo's builds (producer side)
 
@@ -47,9 +48,11 @@ By default the workflow discovers and builds `packages`, `devShells`, and
 
 ## Consume a cache (client side)
 
-Run the proxy (one instance per cache, each on its own port, `NIXCACHE_REPO` set
-to the cache's repo) and point a substituter at it. On standard nix-darwin use
-`darwinModules.default`:
+Run one proxy and point a substituter per cache at it:
+`http://127.0.0.1:<port>/<owner>/<repo>`. If `NIXCACHE_REPO` is set, that repo is
+also served at `http://127.0.0.1:<port>`. List repos in `NIXCACHE_PRELOAD` to load
+their indexes at startup. On standard nix-darwin use `darwinModules.default`
+(one cache, served at the root):
 
 ```nix
 {
@@ -61,8 +64,10 @@ to the cache's repo) and point a substituter at it. On standard nix-darwin use
 ```
 
 On Determinate-managed systems (`nix.enable = false`), `nix.settings` are inert;
-register `http://127.0.0.1:<port>` in `/etc/nix/nix.custom.conf` and run the proxy
-as a launchd daemon directly (see pplanel's nix-darwin `modules/darwin/nixcache.nix`).
+register `http://127.0.0.1:<port>/<owner>/<repo>` in `/etc/nix/nix.custom.conf` and
+run the proxy as a launchd daemon directly (see pplanel's nix-darwin
+`modules/darwin/nixcache.nix`, which also hands it a launchd socket through
+`NIXCACHE_LAUNCHD_SOCKET`). The nix daemon only reads that file at startup, so
+restart it after changing the list.
 
-Run manually: `nix run github:pplanel/nixcache#cache-proxy` with
-`NIXCACHE_REPO=<owner>/<repo>` set.
+Run manually: `nix run github:pplanel/nixcache` (port `NIXCACHE_PORT`, default 37515).

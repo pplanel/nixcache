@@ -12,27 +12,12 @@
     systems = ["aarch64-darwin" "x86_64-darwin" "aarch64-linux" "x86_64-linux"];
     forAllSystems = nixpkgs.lib.genAttrs systems;
   in {
-    # The nixcache-oci proxy: bridges Nix's binary-cache protocol to a
-    # GHCR-hosted cache. The repo it serves is chosen at runtime via
-    # NIXCACHE_REPO, so one build of this package serves any number of caches.
+    # The nixcache-oci proxy: bridges Nix's binary-cache protocol to GHCR-hosted
+    # caches. One daemon serves every cache, chosen per request by URL path
+    # (http://127.0.0.1:<port>/<owner>/<repo>), plus NIXCACHE_REPO at the root.
     packages = forAllSystems (system: let
       pkgs = nixpkgs.legacyPackages.${system};
     in {
-      cache-proxy = pkgs.stdenv.mkDerivation {
-        pname = "nixcache-proxy";
-        version = "0.1.0";
-        src = ./proxy;
-        nativeBuildInputs = [pkgs.python3];
-        installPhase = ''
-          mkdir -p $out/bin
-          cp main.py $out/bin/nixcache-proxy
-          chmod +x $out/bin/nixcache-proxy
-          patchShebangs $out/bin/nixcache-proxy
-        '';
-      };
-      # The Rust rewrite: one daemon serving every cache, chosen per request by
-      # URL path (http://127.0.0.1:<port>/<owner>/<repo>). Replaces running one
-      # cache-proxy per repo.
       nixcache-proxy = pkgs.rustPlatform.buildRustPackage {
         pname = "nixcache-proxy";
         version = "0.1.0";
@@ -43,7 +28,9 @@
         cargoLock.lockFile = ./proxy/Cargo.lock;
         meta.mainProgram = "nixcache-proxy";
       };
-      default = self.packages.${system}.cache-proxy;
+      # The old name, from when this was a Python script.
+      cache-proxy = self.packages.${system}.nixcache-proxy;
+      default = self.packages.${system}.nixcache-proxy;
     });
 
     apps = forAllSystems (system: {

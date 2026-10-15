@@ -5,7 +5,8 @@
 //! `http://127.0.0.1:37515/pplanel/neovix`, and Nix appends `/nix-cache-info`,
 //! `/<hash>.narinfo` and `/nar/<file>` to it. If `NIXCACHE_REPO` is set, that
 //! repo is also served at the root, which matches the old one-proxy-per-repo
-//! layout.
+//! layout. Repos in `NIXCACHE_PRELOAD` (space- or comma-separated) are loaded
+//! at startup instead of on first request.
 
 mod index;
 mod registry;
@@ -46,7 +47,8 @@ fn normalize_repo(owner: &str, repo: &str) -> Option<String> {
     let valid = |s: &str| {
         !s.is_empty()
             && !s.starts_with('.')
-            && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
     };
     (valid(owner) && valid(repo)).then(|| format!("{owner}/{repo}").to_ascii_lowercase())
 }
@@ -83,7 +85,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let default_repo = match env("NIXCACHE_REPO") {
         Some(r) => {
-            let (owner, repo) = r.split_once('/').ok_or("NIXCACHE_REPO must be owner/repo")?;
+            let (owner, repo) = r
+                .split_once('/')
+                .ok_or("NIXCACHE_REPO must be owner/repo")?;
             Some(normalize_repo(owner, repo).ok_or("NIXCACHE_REPO is not a valid owner/repo")?)
         }
         None => None,
@@ -106,9 +110,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         default_repo,
     });
-    if let Some(repo) = &app.default_repo {
-        // Warm the default repo so the first Nix query doesn't wait.
-        let cache = app.caches.get(repo);
+    // Warm these so the first Nix query doesn't wait on the registry.
+    let preload = env("NIXCACHE_PRELOAD").unwrap_or_default();
+    let preload = preload
+        .split([' ', ',', '\n'])
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            r.split_once('/')
+                .and_then(|(owner, repo)| normalize_repo(owner, repo))
+                .ok_or_else(|| format!("NIXCACHE_PRELOAD: {r:?} is not a valid owner/repo"))
+        });
+    let preload: Vec<String> = app
+        .default_repo
+        .iter()
+        .cloned()
+        .map(Ok)
+        .chain(preload)
+        .collect::<Result<_, _>>()?;
+    for repo in preload {
+        let cache = app.caches.get(&repo);
         tokio::spawn(async move { cache.index().await });
     }
 
@@ -178,8 +198,11 @@ mod launchd {
     use std::os::raw::{c_char, c_int};
 
     unsafe extern "C" {
-        fn launch_activate_socket(name: *const c_char, fds: *mut *mut c_int, cnt: *mut usize)
-        -> c_int;
+        fn launch_activate_socket(
+            name: *const c_char,
+            fds: *mut *mut c_int,
+            cnt: *mut usize,
+        ) -> c_int;
     }
 
     pub fn activate(name: &str) -> std::io::Result<Vec<std::net::TcpListener>> {
@@ -201,7 +224,9 @@ mod launchd {
 #[cfg(not(target_os = "macos"))]
 mod launchd {
     pub fn activate(_name: &str) -> std::io::Result<Vec<std::net::TcpListener>> {
-        Err(std::io::Error::other("launchd socket activation is macOS-only"))
+        Err(std::io::Error::other(
+            "launchd socket activation is macOS-only",
+        ))
     }
 }
 
@@ -274,7 +299,11 @@ async fn serve_file(app: &App, repo: String, file: &str) -> Response {
         // instant; this also warms the index for the queries that follow.
         let cache = app.caches.get(&repo);
         tokio::spawn(async move { cache.index().await });
-        return ([(header::CONTENT_TYPE, "text/x-nix-cache-info")], NIX_CACHE_INFO).into_response();
+        return (
+            [(header::CONTENT_TYPE, "text/x-nix-cache-info")],
+            NIX_CACHE_INFO,
+        )
+            .into_response();
     }
 
     let cache = app.caches.get(&repo);
@@ -282,16 +311,22 @@ async fn serve_file(app: &App, repo: String, file: &str) -> Response {
         cache.index().await;
         return Json(cache.status()).into_response();
     }
+    let index = cache.index().await;
+    if !index.available {
+        return unavailable(&repo);
+    }
     if file == "public-key" {
-        return match &cache.index().await.public_key {
-            Some(key) => ([(header::CONTENT_TYPE, "text/plain")], format!("{key}\n")).into_response(),
+        return match &index.public_key {
+            Some(key) => {
+                ([(header::CONTENT_TYPE, "text/plain")], format!("{key}\n")).into_response()
+            }
             None => (StatusCode::NOT_FOUND, "No public key configured\n").into_response(),
         };
     }
     let Some(hash) = file.strip_suffix(".narinfo") else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    match cache.index().await.narinfo(hash) {
+    match index.narinfo(hash) {
         Some(narinfo) => {
             debug!(%repo, hash, "narinfo hit");
             ([(header::CONTENT_TYPE, "text/x-nix-narinfo")], narinfo).into_response()
@@ -305,7 +340,11 @@ async fn serve_file(app: &App, repo: String, file: &str) -> Response {
 
 async fn serve_nar(app: &App, repo: String, file: &str) -> Response {
     let cache = app.caches.get(&repo);
-    let Some(digest) = cache.index().await.nar_digest(file).map(str::to_owned) else {
+    let index = cache.index().await;
+    if !index.available {
+        return unavailable(&repo);
+    }
+    let Some(digest) = index.nar_digest(file).map(str::to_owned) else {
         debug!(%repo, file, "nar miss");
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -341,6 +380,13 @@ async fn serve_nar(app: &App, repo: String, file: &str) -> Response {
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+/// 503, not 404, while the index can't be loaded: Nix caches a 404 narinfo
+/// for an hour, but treats a 5xx as transient.
+fn unavailable(repo: &str) -> Response {
+    debug!(repo, "index unavailable");
+    (StatusCode::SERVICE_UNAVAILABLE, "cache index unavailable\n").into_response()
+}
+
 async fn refresh(app: &App, repo: String) -> Response {
     let entries = app.caches.get(&repo).force_refresh().await;
     Json(json!({ "refreshed": true, "repo": repo, "entries": entries })).into_response()
@@ -352,8 +398,14 @@ mod tests {
 
     #[test]
     fn repo_names() {
-        assert_eq!(normalize_repo("pplanel", "pam_watchid").as_deref(), Some("pplanel/pam_watchid"));
-        assert_eq!(normalize_repo("PPlanel", "Neovix").as_deref(), Some("pplanel/neovix"));
+        assert_eq!(
+            normalize_repo("pplanel", "pam_watchid").as_deref(),
+            Some("pplanel/pam_watchid")
+        );
+        assert_eq!(
+            normalize_repo("PPlanel", "Neovix").as_deref(),
+            Some("pplanel/neovix")
+        );
         assert_eq!(normalize_repo("pplanel", ".."), None);
         assert_eq!(normalize_repo("", "x"), None);
         assert_eq!(normalize_repo("a b", "x"), None);

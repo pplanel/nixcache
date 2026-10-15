@@ -583,11 +583,29 @@ PYEOF
 start_self_substituter() {
     info "Starting self-substituter to reuse previously cached builds"
 
-    # The proxy script is at proxy/main.py relative to the repo root
-    local proxy_script
-    proxy_script="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/proxy/main.py"
-    if [[ ! -f "$proxy_script" ]]; then
-        info "Proxy script not found at $proxy_script, skipping self-substitution"
+    # Build the proxy from this checkout of the nixcache repo, unless
+    # NIXCACHE_PROXY_BIN points at one. On a self-hosted runner the store
+    # keeps it, so it's only rebuilt when the proxy changes.
+    local proxy_bin="${NIXCACHE_PROXY_BIN:-}"
+    if [[ -z "$proxy_bin" ]]; then
+        local tooling_root tooling_ref out
+        tooling_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+        # git+file, with shallow=1 for actions/checkout's depth-1 clones (see
+        # discover_outputs).
+        tooling_ref="path:${tooling_root}"
+        if git -C "$tooling_root" rev-parse --show-toplevel >/dev/null 2>&1; then
+            tooling_ref="git+file://${tooling_root}"
+            if [[ "$(git -C "$tooling_root" rev-parse --is-shallow-repository)" == "true" ]]; then
+                tooling_ref+="?shallow=1"
+            fi
+        fi
+        info "Building nixcache-proxy from $tooling_ref"
+        if out=$(nix build --no-link --print-out-paths "${tooling_ref}#nixcache-proxy"); then
+            proxy_bin="$out/bin/nixcache-proxy"
+        fi
+    fi
+    if [[ ! -x "$proxy_bin" ]]; then
+        info "nixcache-proxy not available, skipping self-substitution"
         return 0
     fi
 
@@ -600,16 +618,13 @@ start_self_substituter() {
         port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     fi
 
-    # NIXCACHE_UPSTREAM="" — skip proxy's internal upstream fallback. Nix
-    # already queries cache.nixos.org and the flake's other substituters
-    # directly in parallel, so the proxy blocking on an upstream HTTP call
-    # per miss just serializes what Nix would otherwise do concurrently.
+    # NIXCACHE_REPO is served at the root, so the substituter below is just
+    # http://127.0.0.1:$port.
     NIXCACHE_REPO="$NIXCACHE_REPO" \
     NIXCACHE_PORT="$port" \
     NIXCACHE_LISTEN=127.0.0.1 \
-    NIXCACHE_UPSTREAM="" \
     GITHUB_TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}" \
-        python3 "$proxy_script" &
+        "$proxy_bin" &
     SELF_PROXY_PID=$!
     # Undo the proxy and the nix.conf edit even if a later step fails under
     # `set -e` (stop_self_substituter is idempotent).
