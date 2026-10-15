@@ -4,3 +4,6 @@ result-*
 # Nix binary-cache signing keys — NEVER commit a private key
 secret.key
 *.secret.key
+
+# Rust build output
+target/

@@ -30,6 +30,19 @@
           patchShebangs $out/bin/nixcache-proxy
         '';
       };
+      # The Rust rewrite: one daemon serving every cache, chosen per request by
+      # URL path (http://127.0.0.1:<port>/<owner>/<repo>). Replaces running one
+      # cache-proxy per repo.
+      nixcache-proxy = pkgs.rustPlatform.buildRustPackage {
+        pname = "nixcache-proxy";
+        version = "0.1.0";
+        src = pkgs.lib.fileset.toSource {
+          root = ./proxy;
+          fileset = pkgs.lib.fileset.unions [./proxy/Cargo.toml ./proxy/Cargo.lock ./proxy/src];
+        };
+        cargoLock.lockFile = ./proxy/Cargo.lock;
+        meta.mainProgram = "nixcache-proxy";
+      };
       default = self.packages.${system}.cache-proxy;
     });
 
