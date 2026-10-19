@@ -25,7 +25,15 @@
           root = ./proxy;
           fileset = pkgs.lib.fileset.unions [./proxy/Cargo.toml ./proxy/Cargo.lock ./proxy/src];
         };
-        cargoLock.lockFile = ./proxy/Cargo.lock;
+        cargoLock = {
+          lockFile = ./proxy/Cargo.lock;
+          # Hash of the pinned `telemetry` rev. Update it whenever the rev in
+          # proxy/Cargo.toml changes (set it to pkgs.lib.fakeHash and read the
+          # real one from the build error).
+          outputHashes = {
+            "telemetry-0.1.0" = "sha256-op/a2dtT+f3ktPyjtl7Rmj+Pgnkel2k/RVeH9AxNJCI=";
+          };
+        };
         meta.mainProgram = "nixcache-proxy";
       };
       # The old name, from when this was a Python script.

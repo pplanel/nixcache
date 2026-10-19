@@ -18,12 +18,14 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{MatchedPath, Path, Request, State};
 use axum::http::{StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use serde_json::json;
-use tracing::{debug, info, warn};
+use tracing::field::Empty;
+use tracing::{Instrument, Span, debug, info, info_span, warn};
 
 use index::{Caches, Shared};
 use registry::{FetchError, Registry};
@@ -62,17 +64,13 @@ fn default_index_dir() -> Option<PathBuf> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nixcache_proxy=info".into()),
-        )
-        .with_ansi(false)
-        .with_writer(std::io::stderr)
-        .init();
+    // Before telemetry: its exporter builds an HTTP client, and reqwest is
+    // compiled here without a crypto provider of its own.
     rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|_| "could not install the rustls crypto provider")?;
+    // Keep the guard to the end of `main`: dropping it flushes the exporters.
+    let _telemetry = telemetry::init(telemetry::service!("nixcache-proxy"))?;
 
     let ttl = Duration::from_secs(
         env("NIXCACHE_INDEX_TTL")
@@ -140,6 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/{owner}/{repo}/{file}", get(repo_file))
         .route("/{owner}/{repo}/_refresh", post(repo_refresh))
         .route("/{owner}/{repo}/nar/{file}", get(repo_nar))
+        .layer(middleware::from_fn(request_span))
         .with_state(app);
 
     let mut servers = tokio::task::JoinSet::new();
@@ -232,6 +231,38 @@ mod launchd {
 
 // ── Handlers ──────────────────────────────────────────────────────────
 
+/// One span per request, with OpenTelemetry's HTTP attribute names. The status
+/// is what matters most here: Nix keeps a 404 narinfo for an hour and treats a
+/// 5xx as transient. The span ends when the response headers are ready, so a
+/// streamed NAR's body is not part of its duration.
+async fn request_span(req: Request, next: Next) -> Response {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned());
+    let span = info_span!(
+        "request",
+        http.request.method = %req.method(),
+        url.path = %req.uri().path(),
+        http.route = route.as_deref(),
+        http.response.status_code = Empty,
+        error.type = Empty,
+        nixcache.repo = Empty,
+    );
+    let response = next.run(req).instrument(span.clone()).await;
+    let status = response.status();
+    span.record("http.response.status_code", status.as_u16());
+    if status.is_server_error() {
+        span.record("error.type", status.as_str());
+    }
+    response
+}
+
+/// Tag the current request span with the cache it is about.
+fn note_repo(repo: &str) {
+    Span::current().record("nixcache.repo", repo);
+}
+
 async fn global_status(State(app): AppState) -> Json<serde_json::Value> {
     let caches: Vec<_> = app.caches.all().iter().map(|c| c.status()).collect();
     Json(json!({
@@ -294,6 +325,7 @@ async fn repo_refresh(
 }
 
 async fn serve_file(app: &App, repo: String, file: &str) -> Response {
+    note_repo(&repo);
     if file == "nix-cache-info" {
         // Answer without touching the index, so Nix's startup probe is
         // instant; this also warms the index for the queries that follow.
@@ -339,6 +371,7 @@ async fn serve_file(app: &App, repo: String, file: &str) -> Response {
 }
 
 async fn serve_nar(app: &App, repo: String, file: &str) -> Response {
+    note_repo(&repo);
     let cache = app.caches.get(&repo);
     let index = cache.index().await;
     if !index.available {
@@ -388,13 +421,16 @@ fn unavailable(repo: &str) -> Response {
 }
 
 async fn refresh(app: &App, repo: String) -> Response {
+    note_repo(&repo);
     let entries = app.caches.get(&repo).force_refresh().await;
     Json(json!({ "refreshed": true, "repo": repo, "entries": entries })).into_response()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_repo;
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
 
     #[test]
     fn repo_names() {
@@ -409,5 +445,85 @@ mod tests {
         assert_eq!(normalize_repo("pplanel", ".."), None);
         assert_eq!(normalize_repo("", "x"), None);
         assert_eq!(normalize_repo("a b", "x"), None);
+    }
+
+    /// Collects what a `tracing` fmt subscriber writes.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The only test that installs a subscriber: it is global, because the
+    /// server runs on other threads, and a callsite's cached interest makes
+    /// scoped subscribers unreliable next to parallel tests.
+    #[tokio::test]
+    async fn request_spans_carry_route_status_and_repo() {
+        // reqwest is built without a crypto provider here; `main` installs this one.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let capture = Capture::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+                .with_writer({
+                    let capture = capture.clone();
+                    move || capture.clone()
+                })
+                .finish(),
+        )
+        .unwrap();
+
+        let router = Router::new()
+            .route(
+                "/{owner}/{repo}/{file}",
+                get(
+                    |Path((owner, repo, _)): Path<(String, String, String)>| async move {
+                        note_repo(&format!("{owner}/{repo}"));
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                ),
+            )
+            .route("/ok", get(|| async { "fine" }))
+            .layer(middleware::from_fn(request_span));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, router).into_future());
+
+        let unavailable = reqwest::get(format!("http://{addr}/pplanel/neovix/abc.narinfo"))
+            .await
+            .unwrap();
+        assert_eq!(unavailable.status(), 503);
+        let fine = reqwest::get(format!("http://{addr}/ok")).await.unwrap();
+        assert_eq!(fine.status(), 200);
+
+        let out = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        let lines: Vec<_> = out.lines().filter(|l| l.contains("request{")).collect();
+        assert_eq!(lines.len(), 2, "one span per request: {out}");
+        let (e503, e200) = (lines[0], lines[1]);
+        for want in [
+            "http.request.method=GET",
+            "url.path=/pplanel/neovix/abc.narinfo",
+            r#"http.route="/{owner}/{repo}/{file}""#,
+            "http.response.status_code=503",
+            r#"error.type="503""#,
+            r#"nixcache.repo="pplanel/neovix""#,
+        ] {
+            assert!(e503.contains(want), "{want} missing: {e503}");
+        }
+        assert!(e200.contains("http.response.status_code=200"), "{e200}");
+        assert!(
+            !e200.contains("error.type"),
+            "a 200 is not an error: {e200}"
+        );
+        assert!(!e200.contains("nixcache.repo"), "no repo on /ok: {e200}");
     }
 }
