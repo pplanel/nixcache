@@ -7,8 +7,12 @@
 //! repo is also served at the root, which matches the old one-proxy-per-repo
 //! layout. Repos in `NIXCACHE_PRELOAD` (space- or comma-separated) are loaded
 //! at startup instead of on first request.
+//!
+//! The other Macs' stores are served at `/_peer/<host>` (src/peer.rs), from
+//! `NIXCACHE_PEERS` (`name=ip:port`, space- or comma-separated).
 
 mod index;
+mod peer;
 mod registry;
 
 use std::net::SocketAddr;
@@ -18,8 +22,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{MatchedPath, Path, Request, State};
-use axum::http::{StatusCode, header};
+use axum::extract::{MatchedPath, Path, RawQuery, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
@@ -28,6 +32,7 @@ use tracing::field::Empty;
 use tracing::{Instrument, Span, debug, info, info_span, warn};
 
 use index::{Caches, Shared};
+use peer::Peers;
 use registry::{FetchError, Registry};
 
 const NIX_CACHE_INFO: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n";
@@ -35,6 +40,7 @@ const NIX_CACHE_INFO: &str = "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 
 struct App {
     caches: Caches,
     default_repo: Option<String>,
+    peers: Peers,
 }
 
 type AppState = State<Arc<App>>;
@@ -91,12 +97,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     let index_dir = default_index_dir();
+    let peers = Peers::parse(
+        &env("NIXCACHE_PEERS").unwrap_or_default(),
+        Duration::from_millis(
+            env("NIXCACHE_PEER_TIMEOUT_MS")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2000),
+        ),
+        Duration::from_secs(
+            env("NIXCACHE_PEER_BACKOFF")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(60),
+        ),
+    )?;
 
     info!(
         registry = registry.host(),
         default_repo = default_repo.as_deref().unwrap_or("-"),
         index_dir = %index_dir.as_deref().map_or("-".into(), |d| d.display().to_string()),
         ttl_secs = ttl.as_secs(),
+        peers = %peers.names().collect::<Vec<_>>().join(" "),
         "nixcache-proxy starting"
     );
 
@@ -107,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             index_dir,
         }),
         default_repo,
+        peers,
     });
     // Warm these so the first Nix query doesn't wait on the registry.
     let preload = env("NIXCACHE_PRELOAD").unwrap_or_default();
@@ -138,6 +159,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/{owner}/{repo}/{file}", get(repo_file))
         .route("/{owner}/{repo}/_refresh", post(repo_refresh))
         .route("/{owner}/{repo}/nar/{file}", get(repo_nar))
+        // `_` can't start a GitHub owner, so these never shadow a repo.
+        .route("/_peer/{host}/{file}", get(peer_file))
+        .route("/_peer/{host}/nar/{file}", get(peer_nar))
         .layer(middleware::from_fn(request_span))
         .with_state(app);
 
@@ -270,7 +294,25 @@ async fn global_status(State(app): AppState) -> Json<serde_json::Value> {
         "default_repo": app.default_repo,
         "index_ttl": app.caches.shared().ttl.as_secs(),
         "caches": caches,
+        "peers": app.peers.status(),
     }))
+}
+
+async fn peer_file(State(app): AppState, Path((host, file)): Path<(String, String)>) -> Response {
+    note_repo(&format!("_peer/{host}"));
+    app.peers.file(&host, &file).await
+}
+
+async fn peer_nar(
+    State(app): AppState,
+    Path((host, file)): Path<(String, String)>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    note_repo(&format!("_peer/{host}"));
+    app.peers
+        .nar(&host, &file, query.as_deref(), &headers)
+        .await
 }
 
 async fn root_file(State(app): AppState, Path(file): Path<String>) -> Response {

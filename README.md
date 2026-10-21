@@ -71,3 +71,18 @@ run the proxy as a launchd daemon directly (see pplanel's nix-darwin
 restart it after changing the list.
 
 Run manually: `nix run github:pplanel/nixcache` (port `NIXCACHE_PORT`, default 37515).
+
+## Other machines' stores (peers)
+
+The proxy also fronts other machines' Nix stores, each served there by a binary
+cache server such as harmonia (which signs on the fly) and reachable here on a
+local port, e.g. an airshell forward. List them in `NIXCACHE_PEERS` as
+`name=ip:port` (space- or comma-separated); each is a substituter at
+`http://127.0.0.1:<port>/_peer/<name>`, with that machine's public key trusted.
+
+Nix asks substituters before building anything, so a peer that's away must not
+make it wait: a narinfo query gets `NIXCACHE_PEER_TIMEOUT_MS` (2000), and a peer
+that times out or errors is skipped for `NIXCACHE_PEER_BACKOFF` seconds (60),
+answering 404 at once. `nix-cache-info` is answered by the proxy (priority 50,
+after cache.nixos.org), so Nix never drops the cache. `/_status` shows each peer
+and how long it's skipped for.
