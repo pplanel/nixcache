@@ -240,11 +240,20 @@ discover_outputs() {
 build_outputs() {
     local refs=("$@")
     local all_paths=()
+    # Keep what we publish rooted on this machine. A persistent runner
+    # (imperium) is also a peer store the other Macs substitute from, minutes
+    # before GHCR has the path, and without a root a GC between the build and
+    # their switch removes it. One link per output, overwritten by the next
+    # build, so only the latest publish of each output stays rooted. On a
+    # hosted runner the directory dies with the VM.
+    local roots_dir="${NIXCACHE_GCROOTS_DIR:-$HOME/.local/state/nixcache/gcroots/${NIXCACHE_REPO:-unknown}}"
+    mkdir -p "$roots_dir"
     for ref in "${refs[@]}"; do
         info "Building $ref"
-        local json_file
+        local json_file link
         json_file=$(mktemp)
-        nix build "$ref" --no-link --accept-flake-config --json > "$json_file" 2>&2 || {
+        link="$roots_dir/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')"
+        nix build "$ref" --out-link "$link" --accept-flake-config --json > "$json_file" 2>&2 || {
             err "Failed to build $ref"
             rm -f "$json_file"
             return 1
