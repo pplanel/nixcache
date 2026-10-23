@@ -722,12 +722,18 @@ find_locally_built_paths() {
     # Walk the closure once. `nix path-info --json --recursive` returns
     # either a list (newer Nix) or a path-keyed object (older Nix); the
     # jq normalization handles both.
+    #
+    # A path substituted from a peer Mac carries that Mac's signature
+    # (`<host>.nix-1`) but was built on our machines, not by any cache:
+    # such signatures don't count, or a path one Mac built first never
+    # reaches GHCR.
+    local peer_keys="${NIXCACHE_PEER_KEYS:-^[a-z0-9-]+\\.nix-1:}"
     nix path-info --json --recursive "${paths[@]}" 2>/dev/null | \
-        jq -r '
+        jq -r --arg peer "$peer_keys" '
             (if type == "array" then .
              else (to_entries | map({path: .key} + .value))
              end) |
-            .[] | select((.signatures // []) | length == 0) | .path
+            .[] | select([(.signatures // [])[] | select(test($peer) | not)] | length == 0) | .path
         ' | while IFS= read -r path; do
             [[ -n "$path" ]] || continue
             local h
@@ -790,8 +796,9 @@ full_pipeline() {
     # Done with the self-substituter — the rest is local + GHCR uploads.
     stop_self_substituter
 
-    # 3. Signature-based filter: upload only paths built locally (no sig).
-    #    Paths with any signature came from some cache already.
+    # 3. Signature-based filter: upload only paths built on our machines
+    #    (no sig, or only peer sigs). Any other signature means a cache
+    #    already has the path.
     info "Inspecting closure signatures to find locally-built paths"
     local upload_list
     upload_list=$(find_locally_built_paths "${paths_array[@]}")
